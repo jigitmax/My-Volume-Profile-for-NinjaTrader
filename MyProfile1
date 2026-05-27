@@ -1,0 +1,448 @@
+//
+// Copyright (C) 2021, NinjaTrader LLC <www.ninjatrader.com>.
+// NinjaTrader reserves the right to modify or overwrite this NinjaScript component with each release.
+//
+#region Using declarations
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.ComponentModel.DataAnnotations;
+using System.Linq;
+using System.Text;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Xml.Serialization;
+using NinjaTrader.Cbi;
+using NinjaTrader.Core;
+using NinjaTrader.Gui;
+using NinjaTrader.Gui.Chart;
+using NinjaTrader.Gui.SuperDom;
+using NinjaTrader.Data;
+using NinjaTrader.NinjaScript;
+using NinjaTrader.Core.FloatingPoint;
+using NinjaTrader.NinjaScript.DrawingTools;
+#endregion
+
+//This namespace holds Indicators in this folder and is required. Do not change it.
+namespace NinjaTrader.NinjaScript.Indicators
+{
+	public class myprofile1 : Indicator
+	{
+		#region Properties
+		internal class VolumeInfoItem
+		{
+			public double up;
+			public double down;
+			public double neutral;
+		}
+
+		private double			alpha				= 50;
+		private double			askPrice;
+		private int				barSpacing			= 1;
+		private double			bidPrice;
+		private DateTime		cacheSessionEnd		= Globals.MinDate;
+		private DateTime		currentDate			= Globals.MinDate;
+		private bool			drawLines;
+		private List<int>		newSessionBarIdx	= new List<int>();
+		private DateTime		sessionDateTmp		= Globals.MinDate;
+		private SessionIterator sessionIterator;
+		private int				startIndexOf;
+		private SessionIterator storedSession;
+		private int 	WidthProfile		=25;
+
+		private List<Dictionary<double, VolumeInfoItem>> 	sortedDicList   = new List<Dictionary<double, VolumeInfoItem>>();
+		private Dictionary<double, VolumeInfoItem> 			cacheDictionary = new Dictionary<double, VolumeInfoItem>();
+		#endregion
+
+		protected override void OnStateChange()
+		{
+			if (State == State.SetDefaults)
+			{
+				Description					= NinjaTrader.Custom.Resource.NinjaScriptIndicatorDescriptionVolumeProfile;
+				Name						= "myprofile1";
+				Calculate					= Calculate.OnEachTick;
+				
+				IsChartOnly					= true;
+				IsOverlay					= true;
+				DrawOnPricePanel			= false;
+				
+				
+			}
+			else if (State == State.Configure)
+			{
+				ZOrder = -1;
+			}
+			else if (State == State.DataLoaded)
+			{
+				storedSession = new SessionIterator(Bars);
+			}
+			else if (State == State.Historical)
+			{
+				if (Calculate != Calculate.OnEachTick)
+					Draw.TextFixed(this, "NinjaScriptInfo", string.Format(NinjaTrader.Custom.Resource.NinjaScriptOnBarCloseError, Name), TextPosition.BottomRight);
+			}
+		}
+
+		protected override void OnBarUpdate() { }
+
+		private DateTime GetLastBarSessionDate(DateTime time)
+		{
+			if (time <= cacheSessionEnd)
+				return sessionDateTmp;
+			
+			if (!Bars.BarsType.IsIntraday)
+				return sessionDateTmp;
+
+			storedSession.GetNextSession(time, true);
+			
+			cacheSessionEnd = storedSession.ActualSessionEnd;
+			sessionDateTmp 	= TimeZoneInfo.ConvertTime(cacheSessionEnd.AddSeconds(-1), Globals.GeneralOptions.TimeZoneInfo, Bars.TradingHours.TimeZoneInfo);
+
+			if(newSessionBarIdx.Count == 0 || newSessionBarIdx.Count > 0 && CurrentBar > newSessionBarIdx[newSessionBarIdx.Count - 1])
+				newSessionBarIdx.Add(CurrentBar);
+
+			return sessionDateTmp;
+		}
+
+		protected override void OnMarketData(MarketDataEventArgs e)
+		{
+			if (Bars.Count <= 0)
+				return;
+
+			double			price;
+			long			volume;
+			VolumeInfoItem	volumeInfoItem;
+			DateTime		lastBarTimeStamp = GetLastBarSessionDate(Time[0]);
+
+			if (lastBarTimeStamp != currentDate)
+			{
+				cacheDictionary = new Dictionary<double, VolumeInfoItem>();
+				sortedDicList.Add(cacheDictionary);
+			}
+
+			currentDate = lastBarTimeStamp;
+			if (Bars.IsTickReplay)
+			{
+				if (e.MarketDataType == MarketDataType.Last)
+				{
+					price	= e.Price;
+					volume	= e.Volume;
+
+					if (!cacheDictionary.ContainsKey(price))
+						cacheDictionary.Add(price, new VolumeInfoItem());
+
+					volumeInfoItem = cacheDictionary[price];
+
+					if (price >= e.Ask)
+						volumeInfoItem.up		+= volume;
+					else if (price <= e.Bid)
+						volumeInfoItem.down		+= volume;
+					else
+						volumeInfoItem.neutral	+= volume;
+				}
+			}
+			else
+			{
+				if (e.MarketDataType == MarketDataType.Ask)
+				{
+					askPrice = e.Price;
+					return;
+				}
+
+				if (e.MarketDataType == MarketDataType.Bid)
+				{
+					bidPrice = e.Price;
+					return;
+				}
+
+				if (e.MarketDataType != MarketDataType.Last || ChartControl == null || askPrice == 0 || bidPrice == 0)
+					return;
+
+				if (Bars != null && !SessionIterator.IsInSession(Core.Globals.Now, true, true))
+					return;
+
+				price	= e.Price;
+				volume	= e.Volume;
+
+				if (!cacheDictionary.ContainsKey(price))
+					cacheDictionary.Add(price, new VolumeInfoItem());
+
+				volumeInfoItem = cacheDictionary[price];
+
+				
+					volumeInfoItem.up		+= volume;
+				
+			}
+		}
+
+		protected override void OnRender(ChartControl chartControl, ChartScale chartScale)
+		{
+			if(Bars == null || Bars.Instrument == null || IsInHitTest)
+				return;
+			try
+			{
+
+			int		firstBarIdxToPaint	= -1;
+			double	tickSize			= Bars.Instrument.MasterInstrument.TickSize;
+			double	volumeMax			= 0;
+			Dictionary<int,int> yprofilepos = new Dictionary<int, int>();
+			int pocv=0;
+			
+			SharpDX.Direct2D1.AntialiasMode oldAntialiasMode = RenderTarget.AntialiasMode;
+			RenderTarget.AntialiasMode = SharpDX.Direct2D1.AntialiasMode.PerPrimitive;
+
+			
+			
+			SharpDX.Color3 dxColor3=new SharpDX.Color3(0.0f,0.5f,1.0f);
+			SharpDX.Color4 dxColor4=new SharpDX.Color4(dxColor3,(float)alpha*0.01f);
+			SharpDX.Direct2D1.SolidColorBrush upBrush			= new SharpDX.Direct2D1.SolidColorBrush(RenderTarget,dxColor4);
+			SharpDX.Color3 dxColor3_1=new SharpDX.Color3(0.0f,0.5f,0.5f);
+			SharpDX.Color4 dxColor4_1=new SharpDX.Color4(dxColor3_1,(float)alpha*0.01f);
+			SharpDX.Direct2D1.SolidColorBrush upBrush_1			= new SharpDX.Direct2D1.SolidColorBrush(RenderTarget,dxColor4_1);
+			SharpDX.Color3 dxColor3_2=new SharpDX.Color3(0.0f,1.0f,0.0f);
+			SharpDX.Color4 dxColor4_2=new SharpDX.Color4(dxColor3_2,(float)alpha*0.01f);
+			SharpDX.Direct2D1.SolidColorBrush upBrush_2			= new SharpDX.Direct2D1.SolidColorBrush(RenderTarget,dxColor4_2);
+			SharpDX.Color3 dxColor3_3=new SharpDX.Color3(0.0f,0.75f,0.0f);
+			SharpDX.Color4 dxColor4_3=new SharpDX.Color4(dxColor3_3,(float)alpha*0.01f);
+			SharpDX.Direct2D1.SolidColorBrush upBrush_3			= new SharpDX.Direct2D1.SolidColorBrush(RenderTarget,dxColor4_3);
+			SharpDX.Color3 dxColor3_4=new SharpDX.Color3(1.0f,1.0f,0.0f);
+			SharpDX.Color4 dxColor4_4=new SharpDX.Color4(dxColor3_4,(float)alpha*0.01f);
+			SharpDX.Direct2D1.SolidColorBrush upBrush_4			= new SharpDX.Direct2D1.SolidColorBrush(RenderTarget,dxColor4_4);
+			SharpDX.Color3 dxColor3_5=new SharpDX.Color3(1.0f,0.75f,0.0f);
+			SharpDX.Color4 dxColor4_5=new SharpDX.Color4(dxColor3_5,(float)alpha*0.01f);
+			SharpDX.Direct2D1.SolidColorBrush upBrush_5			= new SharpDX.Direct2D1.SolidColorBrush(RenderTarget,dxColor4_5);
+			SharpDX.Color3 dxColor3_6=new SharpDX.Color3(1.0f,0.5f,0.0f);
+			SharpDX.Color4 dxColor4_6=new SharpDX.Color4(dxColor3_6,(float)alpha*0.01f);
+			SharpDX.Direct2D1.SolidColorBrush upBrush_6			= new SharpDX.Direct2D1.SolidColorBrush(RenderTarget,dxColor4_6);
+			SharpDX.Color3 dxColor3_7=new SharpDX.Color3(0.75f,0.5f,0.0f);
+			SharpDX.Color4 dxColor4_7=new SharpDX.Color4(dxColor3_7,(float)alpha*0.01f);
+			SharpDX.Direct2D1.SolidColorBrush upBrush_7			= new SharpDX.Direct2D1.SolidColorBrush(RenderTarget,dxColor4_7);
+			SharpDX.Color3 dxColor3_8=new SharpDX.Color3(1.0f,0.0f,0.0f);
+			SharpDX.Color4 dxColor4_8=new SharpDX.Color4(dxColor3_8,(float)alpha*0.01f);
+			SharpDX.Direct2D1.SolidColorBrush upBrush_8			= new SharpDX.Direct2D1.SolidColorBrush(RenderTarget,dxColor4_8);
+			SharpDX.Color3 dxColor3_9=new SharpDX.Color3(0.75f,0.0f,0.0f);
+			SharpDX.Color4 dxColor4_9=new SharpDX.Color4(dxColor3_9,(float)alpha*0.01f);
+			SharpDX.Direct2D1.SolidColorBrush upBrush_9			= new SharpDX.Direct2D1.SolidColorBrush(RenderTarget,dxColor4_9);
+
+			upBrush.Opacity			= (float)(alpha / 100.0);
+			
+
+			for (int i = newSessionBarIdx.Count - 1; i > 0; i--)
+			{
+				//if (newSessionBarIdx[i] <= ChartBars.ToIndex)
+				//{
+					startIndexOf		= i;
+					firstBarIdxToPaint	= newSessionBarIdx[i];
+				//	break;
+				//}
+			
+			float	xpos				= chartControl.GetXByBarIndex(ChartBars, !Bars.IsTickReplay ? ChartBars.FromIndex : Math.Max(1, Math.Max(ChartBars.FromIndex, firstBarIdxToPaint)) - 1);
+			if (xpos>chartControl.GetXByTime(chartControl.FirstTimePainted))
+			{	
+			if (sortedDicList.Count < 1 && cacheDictionary.Keys.Count > 0)
+				sortedDicList.Add(cacheDictionary);
+
+			foreach (Dictionary<double, VolumeInfoItem> tmpDict in sortedDicList)
+			{
+				foreach (KeyValuePair<double, VolumeInfoItem> keyValue in tmpDict)
+				{
+					double price = keyValue.Key;
+
+					if (Bars.BarsType.IsIntraday && (price > chartScale.MaxValue || price < chartScale.MinValue))
+						continue;
+
+					VolumeInfoItem	vii		= keyValue.Value;
+					double			total	= vii.up;
+					volumeMax				= Math.Max(volumeMax, total);
+				}
+			}
+
+			if (volumeMax.ApproxCompare(0) == 0)
+				return;
+
+			int viiPositions = 0;
+
+			foreach (KeyValuePair<double, VolumeInfoItem> keyValue in sortedDicList[startIndexOf])
+			{
+				viiPositions++;
+
+				VolumeInfoItem vii = keyValue.Value;
+				double  myprice				= keyValue.Key;
+				//double	priceLower			= keyValue.Key - tickSize / 2;
+				//float	yLower				= chartScale.GetYByValue(priceLower);
+				//float	yUpper				= chartScale.GetYByValue(priceLower + tickSize);
+				//float	height				= Math.Max(1, Math.Abs(yUpper - yLower) - barSpacing);
+				//int		barWidthUp			= (int)((ChartPanel.W / 2) * (vii.up / volumeMax));
+				//int		barWidthNeutral		= (int)((ChartPanel.W / 2) * (vii.neutral / volumeMax));
+				//int		barWidthDown		= (int)((ChartPanel.W / 2) * (vii.down / volumeMax));
+				//float	stationaryXpos		= chartControl.GetXByBarIndex(ChartBars, !Bars.IsTickReplay ? ChartBars.FromIndex : Math.Max(ChartBars.FromIndex, firstBarIdxToPaint));
+				//float	xpos				= chartControl.GetXByBarIndex(ChartBars, !Bars.IsTickReplay ? ChartBars.FromIndex : Math.Max(1, Math.Max(ChartBars.FromIndex, firstBarIdxToPaint)) - 1);
+				if (yprofilepos.ContainsKey(chartScale.GetYByValue(myprice)))
+			 		{
+						if (yprofilepos[chartScale.GetYByValue(myprice)]<(int)vii.up)
+							yprofilepos[chartScale.GetYByValue(myprice)]=(int)vii.up;
+					}
+					else
+					{
+						yprofilepos.Add(chartScale.GetYByValue(myprice),(int)vii.up);
+					}
+				pocv=Math.Max(pocv,(int)vii.up);
+			}
+			foreach (KeyValuePair<int,int> keyValue in yprofilepos)
+			{
+				//xpos перемещен
+				float	yUpper				= keyValue.Key;
+				//int		barWidthUp			=(int)((ChartPanel.W / 4) * (keyValue.Value / (double)pocv));
+				float	height				=1;
+			
+				int		barWidthUp			=(int)(((int)(chartControl.Properties.BarMarginRight * chartControl.Properties.BarDistance) + WidthProfile)*(keyValue.Value / (double)pocv));
+				
+				
+				//Log(xpos.ToString(),LogLevel.Information);
+				if (xpos>chartControl.GetXByTime(chartControl.FirstTimePainted))
+				{
+					if (keyValue.Value / (double)pocv>0.9f)					
+						RenderTarget.FillRectangle(new SharpDX.RectangleF(xpos, yUpper, barWidthUp, height), upBrush);
+					if (keyValue.Value / (double)pocv <= 0.9f & keyValue.Value / (double)pocv >0.8f)
+						RenderTarget.FillRectangle(new SharpDX.RectangleF(xpos, yUpper, barWidthUp, height), upBrush_1);
+					if (keyValue.Value / (double)pocv <= 0.8f & keyValue.Value / (double)pocv >0.7f)
+						RenderTarget.FillRectangle(new SharpDX.RectangleF(xpos, yUpper, barWidthUp, height), upBrush_2);
+					if (keyValue.Value / (double)pocv <= 0.7f & keyValue.Value / (double)pocv >0.6f)
+						RenderTarget.FillRectangle(new SharpDX.RectangleF(xpos, yUpper, barWidthUp, height), upBrush_3);
+					if (keyValue.Value / (double)pocv <= 0.6f & keyValue.Value / (double)pocv >0.5f)
+						RenderTarget.FillRectangle(new SharpDX.RectangleF(xpos, yUpper, barWidthUp, height), upBrush_4);
+					if (keyValue.Value / (double)pocv <= 0.5f & keyValue.Value / (double)pocv >0.4f)
+						RenderTarget.FillRectangle(new SharpDX.RectangleF(xpos, yUpper, barWidthUp, height), upBrush_5);
+					if (keyValue.Value / (double)pocv <= 0.4f & keyValue.Value / (double)pocv >0.3f)
+						RenderTarget.FillRectangle(new SharpDX.RectangleF(xpos, yUpper, barWidthUp, height), upBrush_6);
+					if (keyValue.Value / (double)pocv <= 0.3f & keyValue.Value / (double)pocv >0.2f)
+						RenderTarget.FillRectangle(new SharpDX.RectangleF(xpos, yUpper, barWidthUp, height), upBrush_7);
+					if (keyValue.Value / (double)pocv <= 0.2f & keyValue.Value / (double)pocv >0.1f)
+						RenderTarget.FillRectangle(new SharpDX.RectangleF(xpos, yUpper, barWidthUp, height), upBrush_8);
+					if (keyValue.Value / (double)pocv <= 0.1f)
+						RenderTarget.FillRectangle(new SharpDX.RectangleF(xpos, yUpper, barWidthUp, height), upBrush_9);
+				
+				
+				
+				}
+				
+			}
+
+			yprofilepos.Clear();
+			pocv=0;
+			
+			}
+			}
+
+			
+			upBrush.Dispose();
+			upBrush_1.Dispose();
+			upBrush_2.Dispose();
+			upBrush_3.Dispose();
+			upBrush_4.Dispose();	
+			upBrush_5.Dispose();
+			upBrush_6.Dispose();
+			upBrush_7.Dispose();	
+			upBrush_8.Dispose();
+			upBrush_9.Dispose();
+			RenderTarget.AntialiasMode = oldAntialiasMode;
+			}
+			catch (Exception e)
+			{
+				Log("Error", LogLevel.Information);
+			}
+		}
+
+		#region Properties
+		[Range(0, double.MaxValue)]
+		[Display(ResourceType = typeof(Custom.Resource), Name = "Opacity", Order = 0, GroupName = "NinjaScriptParameters")]
+		public double Opacity
+		{
+			get { return alpha; }
+			set { alpha = Math.Max(1, value); }
+		}
+		[Range(1, int.MaxValue)]
+		[Display(ResourceType = typeof(Custom.Resource), Name = "width of profile", Order =1,  GroupName = "NinjaScriptParameters")]
+		public int widthprofile
+		{
+			get {return WidthProfile;}
+			set {WidthProfile = Math.Max(1, value);}
+		}
+
+		
+
+	
+
+		private SessionIterator SessionIterator
+		{
+			get
+			{
+				if (sessionIterator == null)
+					sessionIterator = new SessionIterator(Bars);
+				return sessionIterator;
+			}
+		}
+
+		
+		#endregion
+	}
+}
+
+#region NinjaScript generated code. Neither change nor remove.
+
+namespace NinjaTrader.NinjaScript.Indicators
+{
+	public partial class Indicator : NinjaTrader.Gui.NinjaScript.IndicatorRenderBase
+	{
+		private myprofile1[] cachemyprofile1;
+		public myprofile1 myprofile1()
+		{
+			return myprofile1(Input);
+		}
+
+		public myprofile1 myprofile1(ISeries<double> input)
+		{
+			if (cachemyprofile1 != null)
+				for (int idx = 0; idx < cachemyprofile1.Length; idx++)
+					if (cachemyprofile1[idx] != null &&  cachemyprofile1[idx].EqualsInput(input))
+						return cachemyprofile1[idx];
+			return CacheIndicator<myprofile1>(new myprofile1(), input, ref cachemyprofile1);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.MarketAnalyzerColumns
+{
+	public partial class MarketAnalyzerColumn : MarketAnalyzerColumnBase
+	{
+		public Indicators.myprofile1 myprofile1()
+		{
+			return indicator.myprofile1(Input);
+		}
+
+		public Indicators.myprofile1 myprofile1(ISeries<double> input )
+		{
+			return indicator.myprofile1(input);
+		}
+	}
+}
+
+namespace NinjaTrader.NinjaScript.Strategies
+{
+	public partial class Strategy : NinjaTrader.Gui.NinjaScript.StrategyRenderBase
+	{
+		public Indicators.myprofile1 myprofile1()
+		{
+			return indicator.myprofile1(Input);
+		}
+
+		public Indicators.myprofile1 myprofile1(ISeries<double> input )
+		{
+			return indicator.myprofile1(input);
+		}
+	}
+}
+
+#endregion
